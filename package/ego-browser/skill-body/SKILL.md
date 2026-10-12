@@ -108,9 +108,14 @@ infer Playwright methods such as `locator()`, `getByRole()`, `context()`,
 the documented `page.evaluate()` or `page.cdp()` escape hatches instead of
 guessing another method.
 
-Pointer actions accept an optional `label` with a concise 3-6 word description.
-Pass it with clicks, hovers, drags, or scrolling to keep the action text next to
-the visible agent cursor in sync with the action.
+Only these pointer actions accept an optional `label` option: `click()`,
+`dblclick()`, `hover()`, `dragAndDrop()`, `mouse.click()`, `mouse.move()`, and
+`mouse.wheel()`. Pass a concise 3-6 word description to keep the action text
+next to the visible agent cursor in sync with the action. Other methods, such
+as `fill()`, `press()`, `focus()`, `selectOption()`, `waitForSelector()`,
+`keyboard.*()`, `mouse.down()`, and `mouse.up()`, reject a `label` option.
+The `label` in `selectOption(selector, { label })` is different: it selects the
+option whose visible text matches.
 
 When the user explicitly asks for ego-browser, start with a real browser command
 and diagnose the CLI or installation only if it fails.
