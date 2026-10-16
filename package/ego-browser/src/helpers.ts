@@ -3,10 +3,11 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { setOverrides, state } from "./state.js";
-import { invokeEgo, probeAgentControl } from "./ego-errors.js";
+import { buildEgoError, invokeEgo, probeAgentControl } from "./ego-errors.js";
 import { help as helpRuntime, formatHelp } from "./help-runtime.js";
 import { validatePublicApiOptions } from "./public-api-schema.js";
 import { createStaleEgoBrowserGuard } from "./skill-migration.js";
+import { bufferOutput } from "./output-sink.js";
 import { cdp, decodeUnserializableJsValue, js } from "./cdp-eval.js";
 import * as pointer from "./driver/pointer.js";
 import * as keyboard from "./driver/keyboard.js";
@@ -126,6 +127,8 @@ export async function profiles() {
  * bridge when real commands run, not here. The rows below describe what each helper
  * does when the target space is user-owned:
  *
+ *   taskSpace / useOrCreateTaskSpace    -> by name: throws EGO_TASK_SPACE_NAME_IN_USE;
+ *                                          by id: selects it unclaimed (user-control error surfaces)
  *   switchTaskSpace                     -> throws (agent-owned only)
  *   claimTaskSpace                      -> claims it (ownership transfers to the agent), then selects it
  *   handOffTaskSpace                    -> skipped, resolves { done: false, skipped: "user-owned" }
@@ -133,7 +136,7 @@ export async function profiles() {
  *   completeTaskSpace { keep: false }   -> claims it, then closes it
  *   takeOverTaskSpace / waitForAgentControl -> no ownership check (operates as-is)
  *
- * Keep this table in sync with the one in skills/ego-browser/SKILL.md.
+ * Keep this table in sync with the one in skill-body/SKILL.md.
  */
 
 /**
@@ -158,7 +161,7 @@ export async function switchTaskSpace(nameOrId) {
   if (!ego || typeof ego.useTaskSpace !== "function") {
     throw new Error("switchTaskSpace requires ego.useTaskSpace");
   }
-  const space = await findTaskSpace(nameOrId);
+  const space = await findTaskSpace(nameOrId, "switchTaskSpace");
   if (!isAgentOwned(space.ownership)) {
     throw new Error(
       `switchTaskSpace requires an agent-owned task space, got ownership ${JSON.stringify(space.ownership)}`,
@@ -174,6 +177,7 @@ export async function switchTaskSpace(nameOrId) {
  * @returns {Promise<{taskId:string,id:number,name:string,createdBy?:string,ownership?:string,recentTabTitles?:string[]}>}
  */
 export async function newTaskSpace(name, profileId?: string) {
+  assertTaskSpaceName("newTaskSpace", name);
   return (await createTaskSpaceResolution(name, profileId)).descriptor;
 }
 
@@ -216,17 +220,24 @@ async function createTaskSpaceResolution(
 }
 
 /**
- * Use an existing agent-owned task space, or create it when missing. User-owned
- * spaces are selected but not claimed (the EGO_TASK_SPACE_USER_IN_CONTROL error
- * surfaces) — call claimTaskSpace(nameOrId) to take ownership.
+ * Use an existing agent-owned task space, or create it when missing. A name held
+ * by a user-owned space fails with EGO_TASK_SPACE_NAME_IN_USE; a user-owned space
+ * passed by numeric id is selected but not claimed (the
+ * EGO_TASK_SPACE_USER_IN_CONTROL error surfaces). Call claimTaskSpace(id) to take
+ * ownership once the user asks.
  * @param {string|number} nameOrId Task space name or numeric id.
  * @returns {Promise<{taskId:string,id:number,name:string,createdBy?:string,ownership?:string,recentTabTitles?:string[]}>}
  */
 export async function useOrCreateTaskSpace(nameOrId) {
+  assertTaskSpaceLocator("useOrCreateTaskSpace", nameOrId);
   return (await resolveTaskSpace(nameOrId)).descriptor;
 }
 
-async function resolveTaskSpace(nameOrId, options: { select?: boolean } = {}) {
+async function resolveTaskSpace(
+  nameOrId,
+  options: { select?: boolean; op?: string } = {},
+) {
+  const op = options.op ?? "useOrCreateTaskSpace";
   const spaces = await listTaskSpaces();
   const existing = findMatchingTaskSpace(spaces, nameOrId);
   if (!existing) {
@@ -251,10 +262,25 @@ async function resolveTaskSpace(nameOrId, options: { select?: boolean } = {}) {
     };
   }
   if (existing.ownership === "user") {
-    // Don't claim user-owned spaces here. Select it as-is; the user stays in
-    // control, so EGO_TASK_SPACE_USER_IN_CONTROL surfaces (as ego-browser's owned
-    // guidance, not the raw native text). Call claimTaskSpace(nameOrId) to take
-    // ownership.
+    // A name match on a user-owned space is a name collision, not the agent's
+    // task: the user is not "in control" of something the agent started. Report
+    // it the way native createTaskSpace reports a duplicate name.
+    if (typeof nameOrId === "string" && existing.name === nameOrId) {
+      throw buildEgoError(
+        {
+          error: [
+            `A task space named ${JSON.stringify(nameOrId)} already exists and belongs to the user (id ${existing.id}).`,
+            `Do not take it over on your own. Ask the user whether to work in it; only if they agree, call claimTaskSpace(${existing.id}).`,
+            "Otherwise use a different task space name.",
+          ].join("\n"),
+          error_code: "EGO_TASK_SPACE_NAME_IN_USE",
+        },
+        op,
+      );
+    }
+    // Explicitly targeted by id: don't claim it here. Select it as-is; the user
+    // stays in control, so EGO_TASK_SPACE_USER_IN_CONTROL surfaces (as
+    // ego-browser's owned guidance, not the raw native text).
     return {
       descriptor:
         options.select === false
@@ -283,11 +309,12 @@ export async function taskSpace(
   nameOrId,
   options: { profileId?: string } = {},
 ) {
+  assertTaskSpaceLocator("taskSpace", nameOrId);
   validatePublicApiOptions("taskSpace", options);
   const { profileId } = options;
   if (profileId === undefined) {
     return initializeResolvedTaskSpace(
-      await resolveTaskSpace(nameOrId, { select: false }),
+      await resolveTaskSpace(nameOrId, { select: false, op: "taskSpace" }),
     );
   }
   if (typeof nameOrId !== "string") {
@@ -332,7 +359,7 @@ async function initializeResolvedTaskSpace(resolution) {
  * @returns {Promise<import('./page-model.js').TaskSpace>}
  */
 export async function claimTaskSpace(nameOrId) {
-  const space = await findTaskSpace(nameOrId);
+  const space = await findTaskSpace(nameOrId, "claimTaskSpace");
   const claimed = await claimResolvedTaskSpace(space, "claimTaskSpace");
   const task = createTaskSpaceHandle({ ...claimed, ownership: "agent" });
   await captureTaskSpaceUserBoundary(task);
@@ -370,7 +397,7 @@ async function selectTaskSpaceIfProvided(
   op = "taskSpace",
 ) {
   if (nameOrId === undefined) return;
-  const match = await findTaskSpace(nameOrId);
+  const match = await findTaskSpace(nameOrId, op);
   await selectTaskSpace(ego, match, op);
 }
 
@@ -443,7 +470,7 @@ export async function handOffTaskSpace(nameOrId?: string | number) {
     throw new Error("handOffTaskSpace requires ego.handOffTaskSpace");
   }
   if (nameOrId !== undefined) {
-    const match = await findTaskSpace(nameOrId);
+    const match = await findTaskSpace(nameOrId, "handOffTaskSpace");
     if (match.ownership === "user") {
       return { done: false, skipped: "user-owned" as const };
     }
@@ -465,7 +492,7 @@ export async function takeOverTaskSpace(nameOrId?: string | number) {
   }
   let descriptor;
   if (nameOrId !== undefined) {
-    descriptor = await findTaskSpace(nameOrId);
+    descriptor = await findTaskSpace(nameOrId, "takeOverTaskSpace");
     await selectTaskSpace(ego, descriptor, "takeOverTaskSpace");
   }
   await invokeEgo("takeOverTaskSpace", () => ego.takeOverTaskSpace());
@@ -560,11 +587,36 @@ function taskSpaceNumericId(space, op: string) {
   return space.id;
 }
 
-async function findTaskSpace(nameOrId) {
+async function findTaskSpace(nameOrId, op: string) {
+  assertTaskSpaceLocator(op, nameOrId);
   const spaces = await listTaskSpaces();
   const match = findMatchingTaskSpace(spaces, nameOrId);
   if (!match) throw new Error(`task space not found: ${nameOrId}`);
   return match;
+}
+
+// Reject bad locators before any native call: an unmatched string name falls
+// through to creating a space, so undefined must never reach that branch.
+function assertTaskSpaceLocator(op: string, nameOrId: unknown) {
+  if (typeof nameOrId === "number" && Number.isSafeInteger(nameOrId)) return;
+  if (typeof nameOrId === "string" && nameOrId.trim() !== "") return;
+  throw new TypeError(
+    `${op} expects a task-space name (non-empty string) or numeric id, got ${describeLocator(nameOrId)}. ` +
+      `listTaskSpaces() entries expose the numeric id as "id"; pass entry.id.`,
+  );
+}
+
+function assertTaskSpaceName(op: string, name: unknown) {
+  if (typeof name === "string" && name.trim() !== "") return;
+  throw new TypeError(
+    `${op} expects a non-empty task-space name, got ${describeLocator(name)}`,
+  );
+}
+
+function describeLocator(value: unknown) {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number" || value == null) return String(value);
+  return typeof value;
 }
 
 function findMatchingTaskSpace(spaces, nameOrId) {
@@ -640,7 +692,12 @@ export async function learnContext(url = undefined) {
   });
 }
 
-export function helperContext(extra: any = {}) {
+export function helperContext(
+  extra: any = {},
+  {
+    printHelp = (text: string) => bufferOutput(`${text}\n`),
+  }: { printHelp?: (text: string) => void } = {},
+) {
   const { newTab: _newTab, ...publicNav } = nav;
   const all = {
     ...pointer,
@@ -676,11 +733,18 @@ export function helperContext(extra: any = {}) {
     // The formal 1.3 Skill starts through egoBrowser.*. Keep a narrow guard so
     // stale conversations get a recovery instruction instead of a ReferenceError.
     egoBrowser: createStaleEgoBrowserGuard(),
+    // help() prints its text so `ego-browser nodejs -e 'help()'` shows it, and
+    // still returns the text for scripts that already log or inspect it.
     help: (...names: string[]) => {
       const result = helpRuntime(all, ...names);
-      if (typeof result === "string") return result;
-      if (Array.isArray(result)) return result.map(formatHelp).join("\n\n");
-      return formatHelp(result);
+      const text =
+        typeof result === "string"
+          ? result
+          : Array.isArray(result)
+            ? result.map(formatHelp).join("\n\n")
+            : formatHelp(result);
+      printHelp(text);
+      return text;
     },
   };
 }

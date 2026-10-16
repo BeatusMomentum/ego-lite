@@ -1572,6 +1572,62 @@ test("TaskSpace finish validates every retained label before closing Pages", asy
   });
 });
 
+test("Page reports existing labels when an Agent uses one it never created", async () => {
+  await withFixture(async (fixture) => {
+    const task = taskForRound(fixture, "round-a");
+    await openTestPage(task, "https://example.test/one");
+
+    const guessed = task.page("p2");
+    assert.ok(guessed, "task.page returns a handle even for an unknown label");
+    await assert.rejects(
+      () => guessed.url(),
+      (error) => {
+        assert.match(error.message, /^page label not found: p2\. /);
+        assert.match(error.message, /Managed Pages in task space 7: p1\./);
+        assert.match(error.message, /await task\.newPage\(\)/);
+        return true;
+      },
+    );
+  });
+});
+
+test("Page reports a finished task when used after finish in the same round", async () => {
+  await withFixture(async (fixture) => {
+    const task = taskForRound(fixture, "round-a", {
+      async completeTaskSpace() {},
+    });
+    const page = await openTestPage(task, "https://example.test/one");
+    await task.finish({ keep: ["p1"] });
+
+    await assert.rejects(
+      () => page.url(),
+      /^Error: page label not found: p1\. Task space 7 already finished/,
+    );
+  });
+});
+
+test("Page reports user ownership when a later round reuses a finished task's label", async () => {
+  await withFixture(async (fixture) => {
+    const task = taskForRound(fixture, "round-a", {
+      async completeTaskSpace() {},
+    });
+    await openTestPage(task, "https://example.test/one");
+    await task.finish({ keep: ["p1"] });
+
+    const nextRound = createTaskSpaceHandle(
+      { id: 7, name: "research", ownership: "user" },
+      {
+        ledger: new PageLedgerStore({ rootDir: fixture.rootDir }),
+        ...fixture.services,
+      },
+    );
+    await assert.rejects(
+      () => nextRound.page("p1").url(),
+      /^Error: page label not found: p1\. Task space 7 is owned by the user/,
+    );
+  });
+});
+
 test("handoff preserves user-created tabs as unknown and captures the active user page", async () => {
   await withFixture(async (fixture) => {
     const firstRound = taskForRound(fixture, "round-a", {
@@ -2531,6 +2587,19 @@ test("metadata reads stay target-scoped while evaluate and screenshot activate t
       () => first.screenshot("/tmp/legacy.png"),
       /options must be an object/,
     );
+    for (const path of ["./step1-initial.png", "shots/before.png", ""]) {
+      await assert.rejects(
+        () => first.screenshot({ path }),
+        /page\.screenshot path must be an absolute file path/,
+        `page.screenshot must reject the relative path ${JSON.stringify(path)}`,
+      );
+    }
+    assert(
+      !fixture.calls.some(
+        ([kind, path]) => kind === "screenshot" && !path.startsWith("/"),
+      ),
+      "relative screenshot paths must be rejected before capture",
+    );
     assert.equal(
       fixture.activeTarget(),
       "target-1",
@@ -3015,6 +3084,18 @@ test("Page fetch saves a binary response without converting it to text", async (
     assert.equal(response.savedPath, path);
     assert.equal(response.body, undefined);
     assert.deepEqual(await readFile(path), Buffer.from("\x89PNG\r\n\x1a\n"));
+  });
+});
+
+test("Page fetch rejects a relative saveAs path before requesting", async () => {
+  await withFixture(async (fixture) => {
+    const task = taskForRound(fixture, "round-a");
+    const page = await openTestPage(task, "https://example.test/fetch");
+
+    await assert.rejects(
+      () => page.fetch("/image.png", { saveAs: "./image.png" }),
+      /page\.fetch saveAs must be an absolute file path/,
+    );
   });
 });
 
@@ -3996,6 +4077,31 @@ test("Page keyboard paste forwards plain-text and HTML clipboard representations
         (call) => call[0] === "clipboard" && call[1] === "write",
       ),
       ["clipboard", "write", content],
+    );
+  });
+});
+
+test("Page keyboard paste names the invalid argument type", async () => {
+  await withFixture(async (fixture) => {
+    const task = taskForRound(fixture, "round-a", { platform: "win32" });
+    const page = await openTestPage(task, "https://example.test/table");
+
+    for (const [value, received] of [
+      [undefined, "undefined"],
+      [null, "null"],
+      [["A", "B"], "an array"],
+      [42, "number"],
+    ]) {
+      await assert.rejects(
+        () => page.keyboard.paste(value),
+        new RegExp(
+          `requires a string or \\{ text, html\\? \\}, received ${received}$`,
+        ),
+      );
+    }
+    assert.equal(
+      fixture.calls.some((call) => call[0] === "clipboard"),
+      false,
     );
   });
 });
@@ -5003,6 +5109,10 @@ test("Page waitForURL validates its matcher and reports the last URL", async () 
     await assert.rejects(
       () => page.waitForURL(async () => true, { timeout: 10 }),
       /predicate must return a boolean synchronously/,
+    );
+    await assert.rejects(
+      () => page.waitForURL((url) => url.includes("/search?"), { timeout: 10 }),
+      /url\.includes is not a function.*receives a URL object; use url\.href/,
     );
     await assert.rejects(
       () => page.waitForURL("**/{ready", { timeout: 10 }),

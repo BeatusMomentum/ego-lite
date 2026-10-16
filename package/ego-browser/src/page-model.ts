@@ -1,5 +1,5 @@
 import { mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 
 import {
   browserCdp,
@@ -671,6 +671,7 @@ const captureUserBoundaryToken = Symbol("captureUserBoundary");
 const initializeTaskSpaceToken = Symbol("initializeTaskSpace");
 const initializeCreatedSpaceToken = Symbol("initializeCreatedSpace");
 const rollbackCreatedTaskSpaceToken = Symbol("rollbackCreatedTaskSpace");
+const describeMissingPageToken = Symbol("describeMissingPage");
 
 const defaultGate: OperationGate = {
   withSpace: defaultWithSpace,
@@ -842,6 +843,7 @@ class TaskSpace {
   #userPage?: Page | UnmanagedPage;
   #stopBrowserEvents?: () => void;
   #backgroundDiscoveryInitialized = false;
+  #finished = false;
 
   constructor(descriptor: TaskSpaceDescriptor, services: PageModelServices) {
     this.taskId = descriptor.taskId;
@@ -1106,9 +1108,45 @@ class TaskSpace {
   }
 
   async #discardTerminalState(): Promise<void> {
+    this.#finished = true;
     await this.#services.ledger.discard(this.spaceId);
     this.#stopBackgroundPageDiscovery();
     clearSpacePageNotices(this.spaceId);
+  }
+
+  /**
+   * Explain an unknown Page label in task-lifecycle terms: the same ledger miss
+   * means "never created" during a task but "already ended" after finish().
+   */
+  async [describeMissingPageToken](
+    label: string,
+    error: unknown,
+  ): Promise<unknown> {
+    if (
+      !(error instanceof Error) ||
+      error.message !== `page label not found: ${label}`
+    ) {
+      return error;
+    }
+    if (this.#finished) {
+      return new Error(
+        `${error.message}. Task space ${this.id} already finished, which ended its Page labels; do not use Pages after task.finish()`,
+        { cause: error },
+      );
+    }
+    if (this.ownership !== "agent") {
+      return new Error(
+        `${error.message}. Task space ${this.id} is owned by the user, so labels from a finished Agent task no longer exist; stop operating it unless the user asks you to continue`,
+        { cause: error },
+      );
+    }
+    const labels = Object.keys(
+      (await this.#services.ledger.read(this.id)).pages,
+    );
+    return new Error(
+      `${error.message}. Managed Pages in task space ${this.id}: ${labels.join(", ") || "none"}. task.page(label) only refers to an existing Page; create one with await task.newPage()`,
+      { cause: error },
+    );
   }
 
   /** Send a Target or Browser domain command within this selected space. */
@@ -2134,8 +2172,8 @@ class Page {
   async screenshot(options: PageScreenshotOptions = {}): Promise<string> {
     validatePublicApiOptions("Page.screenshot", options);
     const { path, fullPage, ...captureOptions } = options;
-    if (path !== undefined && (typeof path !== "string" || path.length === 0)) {
-      throw new TypeError("page.screenshot path must be a non-empty string");
+    if (path !== undefined) {
+      assertAbsoluteFilePath(path, "page.screenshot path");
     }
     const page = await this.#resolve();
     return this.#services.gate.withPage(page, async ({ sessionId }) => {
@@ -2453,7 +2491,11 @@ class Page {
   }
 
   async #resolve(): Promise<PageTarget> {
-    const entry = await this.#services.ledger.getPage(this.spaceId, this.label);
+    const entry = await this.#services.ledger
+      .getPage(this.spaceId, this.label)
+      .catch(async (error) => {
+        throw await this.#task[describeMissingPageToken](this.label, error);
+      });
     this.#targetId = entry.targetId;
     this.#openedBy = entry.openedBy;
     markPageObserved(this.spaceId, entry.targetId);
@@ -3340,12 +3382,25 @@ function serializeJsonValue(value: unknown, message: string): unknown {
   }
 }
 
+// The script does not run in the caller's shell working directory: the host
+// starts the Node context from the application's own directory, which is not
+// writable on Windows. Reject relative paths up front instead of surfacing a
+// confusing EPERM from that directory.
+function assertAbsoluteFilePath(path: unknown, label: string): void {
+  if (typeof path !== "string" || path.length === 0 || !isAbsolute(path)) {
+    throw new TypeError(`${label} must be an absolute file path`);
+  }
+}
+
 function pageFetchPayload(
   url: string,
   options: PageFetchOptions,
 ): { payload: PageFetchPayload; saveAs?: string } {
   validatePublicApiOptions("Page.fetch", options);
   const { timeout = 20_000, saveAs, ...requestOptions } = options;
+  if (saveAs !== undefined) {
+    assertAbsoluteFilePath(saveAs, "page.fetch saveAs");
+  }
   return {
     payload: {
       url,
