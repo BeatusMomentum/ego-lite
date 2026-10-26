@@ -36,9 +36,9 @@ env:
 
 jobs:
   star-history:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       # render-charts.sh decides "changed" by comparing .star-history.sig, and
       # falls back to the existing chart when the stargazers API rate-limits it.
@@ -64,15 +64,18 @@ jobs:
       # for the same reason: the README already carries absolute CHART_BRANCH
       # URLs, which the action's relative-path rewrite would undo.
       - name: Check out pinned chart renderer
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           repository: narayann7/star-history-action
           ref: a68d8f9d67ca20d55b682a264e69152dcf326e9c
           path: .star-history-action
           persist-credentials: false
 
-      - name: Round the Y axis up to a labelled tick
-        run: git -C .star-history-action apply "$GITHUB_WORKSPACE/.github/star-history/y-axis.patch"
+      - name: Apply renderer axis and Action runtime fixes
+        run: |
+          git -C .star-history-action apply \
+            "$GITHUB_WORKSPACE/.github/star-history/y-axis.patch" \
+            "$GITHUB_WORKSPACE/.github/star-history/action-runtime.patch"
 
       - id: chart
         uses: ./.star-history-action
